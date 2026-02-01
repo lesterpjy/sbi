@@ -161,8 +161,12 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
             x, exclude_invalid_x=exclude_invalid_x
         )
 
-        x = x[is_valid_x]
-        theta = theta[is_valid_x]
+        # Only apply boolean indexing if some rows are invalid.
+        # Boolean fancy indexing always copies the tensor, which wastes
+        # gigabytes of RAM for large datasets when all rows are valid.
+        if not is_valid_x.all():
+            x = x[is_valid_x]
+            theta = theta[is_valid_x]
 
         # Check for problematic z-scoring
         warn_if_zscoring_changes_data(x)
@@ -494,10 +498,11 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
             A tensor containing the computed losses for each sample in the batch.
         """
 
-        # Get batches on current device.
+        # Get batches on current device (cast to float32 for computation;
+        # x may be stored as float16 to halve system RAM usage).
         theta_batch, x_batch, masks_batch = (
             batch[0].to(self._device),
-            batch[1].to(self._device),
+            batch[1].to(self._device).float(),
             batch[2].to(self._device),
         )
 
@@ -677,17 +682,24 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
         if self._neural_net is None or retrain_from_scratch:
             # Get theta,x to initialize NN
             theta, x, _ = self.get_simulations(starting_round=start_idx)
-            # Use only training data for building the neural net (z-scoring transforms)
+            # Pass a small batch for shape inference / z-scoring instead of
+            # the full training split.  Fancy indexing with train_indices
+            # copies the entire tensor, which wastes gigabytes of RAM for
+            # large datasets (e.g. 3.6 GB for 90k × 10 × 1000 xu).
+            # A small slice is sufficient for get_numel (shape) and
+            # standardizing_net (mean/std computed from this batch).
+            n_build = min(1000, len(self.train_indices))
+            build_idx = self.train_indices[:n_build]
 
             self._neural_net = self._build_neural_net(
-                theta[self.train_indices].to("cpu"),
-                x[self.train_indices].to("cpu"),
+                theta[build_idx].to("cpu").float(),
+                x[build_idx].to("cpu").float(),
             )
 
             test_posterior_net_for_multi_d_x(
                 self._neural_net,
-                theta.to("cpu"),
-                x.to("cpu"),
+                theta[:2].to("cpu").float(),
+                x[:2].to("cpu").float(),
             )
 
             del theta, x

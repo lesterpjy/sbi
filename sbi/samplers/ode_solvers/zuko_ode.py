@@ -25,6 +25,7 @@ class ZukoNeuralODE(NeuralODE):
         std_base: Tensor,
         t_min: float = 0.0,
         t_max: float = 1.0,
+        condition_event_ndim: int = 1,
         atol: float = 1e-6,
         rtol: float = 1e-5,
         exact: bool = True,
@@ -53,6 +54,8 @@ class ZukoNeuralODE(NeuralODE):
                 Expected shape: (1, theta_dim).
             t_min: The minimum time value for the ODE solver.
             t_max: The maximum time value for the ODE solver.
+            condition_event_ndim: Number of trailing dimensions in the condition
+                tensor that form the event shape (default 1).
             atol: The absolute tolerance for the ODE solver.
             rtol: The relative tolerance for the ODE solver.
             exact: Whether the exact log-determinant of the Jacobian or an unbiased
@@ -66,6 +69,7 @@ class ZukoNeuralODE(NeuralODE):
             std_base,
             t_min,
             t_max,
+            condition_event_ndim=condition_event_ndim,
             atol=atol,
             rtol=rtol,
             exact=exact,
@@ -92,9 +96,15 @@ class ZukoNeuralODE(NeuralODE):
             **kwargs,
         )
 
+        # Compute batch shape by stripping condition event dims.
+        # For 1D conditions (batch, features), this gives (batch,).
+        # For multi-dim conditions (batch, K, features), this gives (batch,).
+        n_event = self.condition_event_ndim
+        batch_shape = condition.shape[:-n_event] if n_event > 0 else condition.shape
+
         return NormalizingFlow(
             transform=transform,
-            base=DiagNormal(self.mean_base, self.std_base).expand(condition.shape[:-1]),
+            base=DiagNormal(self.mean_base, self.std_base).expand(batch_shape),
         )
 
     def _f_condition_last(self, t, input, condition):

@@ -496,11 +496,16 @@ def get_simulations_since_round(
         starting_round_index: From which round onwards to return the data. We start
             counting from 0.
     """
-    return torch.cat([
+    filtered = [
         t
         for t, r in zip(data, data_round_indices, strict=False)
         if r >= starting_round_index
-    ])
+    ]
+    # Avoid torch.cat on a single tensor — cat always copies, wasting memory
+    # for large datasets (e.g. 2 GB xu in single-round COPE training).
+    if len(filtered) == 1:
+        return filtered[0]
+    return torch.cat(filtered)
 
 
 def mask_sims_from_prior(round_: int, num_simulations: int) -> Tensor:

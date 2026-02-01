@@ -100,7 +100,14 @@ class PermutationInvariantEmbedding(nn.Module):
         is_nan = torch.isnan(x)
         # apply trial net with nan entries replaced with 0
         masked_x = torch.nan_to_num(x, nan=0.0)
-        trial_embeddings = self.trial_net(masked_x)
+        # Reshape to (batch * K, input_dim) so trial_net sees 2D input,
+        # then reshape back to (batch, K, trial_output_dim).
+        input_dim = masked_x.shape[-1]
+        flat_x = masked_x.reshape(-1, input_dim)
+        flat_embeddings = self.trial_net(flat_x)
+        trial_embeddings = flat_embeddings.reshape(
+            num_batch, max_num_trials, -1
+        )
         # replace previous nan entries with zeros
         trial_embeddings = trial_embeddings * (~is_nan.all(-1, keepdim=True)).float()
 

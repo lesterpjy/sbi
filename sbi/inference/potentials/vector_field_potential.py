@@ -68,6 +68,9 @@ class VectorFieldBasedPotential(BasePotential):
             backend=neural_ode_backend,
             t_min=self.vector_field_estimator.t_min,
             t_max=self.vector_field_estimator.t_max,
+            condition_event_ndim=len(
+                self.vector_field_estimator.condition_shape
+            ),
             **neural_ode_kwargs,
         )
 

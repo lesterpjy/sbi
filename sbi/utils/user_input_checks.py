@@ -755,7 +755,9 @@ def validate_theta_and_x(
     # I did not fuse these asserts with the `isinstance(x, Tensor)` asserts in order
     # to give more explicit errors.
     assert theta.dtype == float32, "Type of parameters must be float32."
-    assert x.dtype == float32, "Type of simulator outputs must be float32."
+    assert x.dtype in (float32, torch.float16), (
+        "Type of simulator outputs must be float32 or float16."
+    )
 
     if str(x.device) != str(data_device):
         warnings.warn(

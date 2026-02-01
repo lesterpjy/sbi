@@ -52,6 +52,7 @@ class NeuralODE(LazyDistribution):
         std_base: Tensor,
         t_min: float = 0.0,
         t_max: float = 1.0,
+        condition_event_ndim: int = 1,
         **kwargs,
     ):
         r"""
@@ -72,6 +73,10 @@ class NeuralODE(LazyDistribution):
                 Expected shape: (1, theta_dim).
             t_min: The minimum time value for the ODE solver.
             t_max: The maximum time value for the ODE solver.
+            condition_event_ndim: Number of trailing dimensions in the condition
+                tensor that form the event shape (default 1 for 1D conditions).
+                Used to correctly determine batch vs event dims when expanding
+                the base distribution.
             **kwargs: Additional arguments for the ODE solver.
         """
         super().__init__()
@@ -81,6 +86,7 @@ class NeuralODE(LazyDistribution):
         self.t_max = t_max
         self.mean_base = mean_base
         self.std_base = std_base
+        self.condition_event_ndim = condition_event_ndim
         self.params: Dict[str, Any] = kwargs
 
     def update_params(self, **kwargs) -> None:

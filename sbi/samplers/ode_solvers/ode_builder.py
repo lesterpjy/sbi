@@ -19,6 +19,7 @@ def build_neural_ode(
     backend: str = "zuko",
     t_min: float = 0.0,
     t_max: float = 1.0,
+    condition_event_ndim: int = 1,
     **kwargs,
 ) -> NeuralODE:
     r"""
@@ -38,6 +39,8 @@ def build_neural_ode(
         backend: The backend to be used. Currently only "zuko" is supported.
         t_min: The minimum time value.
         t_max: The maximum time value.
+        condition_event_ndim: Number of trailing dimensions in the condition
+            tensor that form the event shape (default 1 for 1D conditions).
         **kwargs: Additional arguments provided to the backend.
 
     Returns:
@@ -47,6 +50,9 @@ def build_neural_ode(
         ValueError: If the backend is not supported.
     """
     if backend == "zuko":
-        return ZukoNeuralODE(f, net, mean_base, std_base, t_min, t_max, **kwargs)
+        return ZukoNeuralODE(
+            f, net, mean_base, std_base, t_min, t_max,
+            condition_event_ndim=condition_event_ndim, **kwargs,
+        )
     else:
         raise ValueError(f"Backend {backend} not supported")

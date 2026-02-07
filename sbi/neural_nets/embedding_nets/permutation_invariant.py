@@ -31,6 +31,7 @@ class PermutationInvariantEmbedding(nn.Module):
         num_layers: int = 2,
         output_dim: int = 20,
         aggregation_dim: int = 1,
+        skip_nan_check: bool = False,
     ):
         """Permutation invariant multi-layer NN.
 
@@ -59,10 +60,13 @@ class PermutationInvariantEmbedding(nn.Module):
             num_hiddens: Number of hidden dimensions in fully-connected layers.
             output_dim: Dimensionality of the output.
             aggregation_dim: Dimension along which to aggregate the trial embeddings.
+            skip_nan_check: If True, skip NaN checking for faster forward pass.
+                Only use when data is guaranteed to have no NaNs.
         """
         super().__init__()
         self.trial_net = trial_net
         self.aggregation_dim = aggregation_dim
+        self.skip_nan_check = skip_nan_check
         assert aggregation_fn in [
             "mean",
             "sum",
@@ -85,42 +89,66 @@ class PermutationInvariantEmbedding(nn.Module):
             Network output (batch_size, output_dim).
         """
 
-        # Get number of trials from non-nan entries
         num_batch, max_num_trials = x.shape[0], x.shape[self.aggregation_dim]
-        nan_counts = (
-            torch.isnan(x)
-            .sum(dim=self.aggregation_dim)  # count nans over trial dimension
-            .reshape(-1)[:num_batch]  # counts are the same across data dims
-            .unsqueeze(-1)  # make it (batch, 1) to match embeddings below
-        )
-        # number of non-nan trials
-        trial_counts = max_num_trials - nan_counts
 
-        # get nan entries
-        is_nan = torch.isnan(x)
-        # apply trial net with nan entries replaced with 0
-        masked_x = torch.nan_to_num(x, nan=0.0)
-        # Reshape to (batch * K, input_dim) so trial_net sees 2D input,
-        # then reshape back to (batch, K, trial_output_dim).
-        input_dim = masked_x.shape[-1]
-        flat_x = masked_x.reshape(-1, input_dim)
-        flat_embeddings = self.trial_net(flat_x)
-        trial_embeddings = flat_embeddings.reshape(
-            num_batch, max_num_trials, -1
-        )
-        # replace previous nan entries with zeros
-        trial_embeddings = trial_embeddings * (~is_nan.all(-1, keepdim=True)).float()
-
-        # Take mean over permutation dimension divide by number of trials
-        # (instead of just taking torch.mean) to account for masking.
-        if self.aggregation_fn == "mean":
-            combined_embedding = (
-                trial_embeddings.sum(dim=self.aggregation_dim) / trial_counts
+        if self.skip_nan_check:
+            # Fast path: no NaN checking, all trials are valid
+            # trial_counts is constant max_num_trials for all batch elements
+            trial_counts = torch.full(
+                (num_batch, 1), max_num_trials, device=x.device, dtype=x.dtype
             )
-        else:
-            combined_embedding = trial_embeddings.sum(dim=self.aggregation_dim)
 
-        assert not torch.isnan(combined_embedding).any(), "NaNs in embedding."
+            # Reshape to (batch * K, input_dim) so trial_net sees 2D input,
+            # then reshape back to (batch, K, trial_output_dim).
+            input_dim = x.shape[-1]
+            flat_x = x.reshape(-1, input_dim)
+            flat_embeddings = self.trial_net(flat_x)
+            trial_embeddings = flat_embeddings.reshape(
+                num_batch, max_num_trials, -1
+            )
+
+            # Aggregate over trials
+            if self.aggregation_fn == "mean":
+                combined_embedding = trial_embeddings.mean(dim=self.aggregation_dim)
+            else:
+                combined_embedding = trial_embeddings.sum(dim=self.aggregation_dim)
+
+        else:
+            # Original path with NaN handling
+            nan_counts = (
+                torch.isnan(x)
+                .sum(dim=self.aggregation_dim)  # count nans over trial dimension
+                .reshape(-1)[:num_batch]  # counts are the same across data dims
+                .unsqueeze(-1)  # make it (batch, 1) to match embeddings below
+            )
+            # number of non-nan trials
+            trial_counts = max_num_trials - nan_counts
+
+            # get nan entries
+            is_nan = torch.isnan(x)
+            # apply trial net with nan entries replaced with 0
+            masked_x = torch.nan_to_num(x, nan=0.0)
+            # Reshape to (batch * K, input_dim) so trial_net sees 2D input,
+            # then reshape back to (batch, K, trial_output_dim).
+            input_dim = masked_x.shape[-1]
+            flat_x = masked_x.reshape(-1, input_dim)
+            flat_embeddings = self.trial_net(flat_x)
+            trial_embeddings = flat_embeddings.reshape(
+                num_batch, max_num_trials, -1
+            )
+            # replace previous nan entries with zeros
+            trial_embeddings = trial_embeddings * (~is_nan.all(-1, keepdim=True)).float()
+
+            # Take mean over permutation dimension divide by number of trials
+            # (instead of just taking torch.mean) to account for masking.
+            if self.aggregation_fn == "mean":
+                combined_embedding = (
+                    trial_embeddings.sum(dim=self.aggregation_dim) / trial_counts
+                )
+            else:
+                combined_embedding = trial_embeddings.sum(dim=self.aggregation_dim)
+
+            assert not torch.isnan(combined_embedding).any(), "NaNs in embedding."
 
         # add number of trials as additional input
         return self.fc_subnet(torch.cat([combined_embedding, trial_counts], dim=1))

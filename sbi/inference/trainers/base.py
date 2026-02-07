@@ -25,9 +25,11 @@ from warnings import warn
 
 import torch
 from torch import Tensor
+from torch.cuda.amp import GradScaler, autocast
 from torch.distributions import Distribution
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.adam import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils import data
 from torch.utils.data.sampler import SubsetRandomSampler
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -955,9 +957,33 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
             )
             self.epoch, self.val_loss = 0, float("Inf")
 
+        # Set up ReduceLROnPlateau scheduler (matching official FMPE)
+        if train_config.use_scheduler:
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=train_config.scheduler_factor,
+                patience=train_config.scheduler_patience,
+            )
+        else:
+            self.scheduler = None
+
+        # Set up AMP (Automatic Mixed Precision) for faster GPU training
+        self.use_amp = train_config.use_amp and self._device != "cpu"
+        if self.use_amp:
+            self.grad_scaler = GradScaler()
+        else:
+            self.grad_scaler = None
+
         while self.epoch <= train_config.max_num_epochs and not self._converged(
             self.epoch, train_config.stop_after_epochs
         ):
+            # Update epoch on batch_sampler for proper shuffling (streaming mode)
+            if hasattr(train_loader, 'batch_sampler') and hasattr(
+                train_loader.batch_sampler, 'set_epoch'
+            ):
+                train_loader.batch_sampler.set_epoch(self.epoch)
+
             # Train for a single epoch.
             self._neural_net.train()
             epoch_start_time = time.time()
@@ -965,14 +991,68 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
                 train_loader, train_config.clip_max_norm, loss_args
             )
 
-            # Calculate validation performance.
-            self._neural_net.eval()
+            # Calculate validation performance (skip some epochs if configured)
+            validate_every = train_config.validate_every_n_epochs
+            should_validate = (
+                self.epoch == 0  # Always validate first epoch
+                or (self.epoch + 1) % validate_every == 0  # Validate every N epochs
+                or self.epoch >= train_config.max_num_epochs - 1  # Always validate last
+            )
 
-            self._val_loss = self._validate_epoch(val_loader, loss_args)
+            if should_validate:
+                self._neural_net.eval()
+                self._val_loss = self._validate_epoch(val_loader, loss_args)
+            # else: keep previous self._val_loss
 
             self._summarize_epoch(
                 train_loss, self._val_loss, epoch_start_time, summarization_kwargs
             )
+
+            # Step scheduler based on validation loss (only when we validated)
+            if self.scheduler is not None and should_validate:
+                self.scheduler.step(self._val_loss)
+
+            # Call epoch callback for live logging (e.g., to wandb)
+            if train_config.epoch_callback is not None:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                epoch_time = time.time() - epoch_start_time
+                train_config.epoch_callback(
+                    epoch=self.epoch,
+                    train_loss=train_loss,
+                    val_loss=self._val_loss,
+                    lr=current_lr,
+                    best_val_loss=self._best_val_loss,
+                    epochs_since_improvement=self._epochs_since_last_improvement,
+                    validated_this_epoch=should_validate,
+                    epoch_time=epoch_time,
+                )
+
+            # Checkpoint saving
+            if train_config.checkpoint_dir is not None:
+                checkpoint_dir = Path(train_config.checkpoint_dir)
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save best model when validation improves
+                if should_validate and self._val_loss < self._best_val_loss:
+                    self._best_val_loss = self._val_loss
+                    self._save_checkpoint(
+                        checkpoint_dir / "best_model.pt",
+                        epoch=self.epoch,
+                        train_loss=train_loss,
+                        val_loss=self._val_loss,
+                        is_best=True,
+                    )
+
+                # Save periodic checkpoint
+                save_every = train_config.save_every_n_epochs
+                if not train_config.save_best_only and (self.epoch + 1) % save_every == 0:
+                    self._save_checkpoint(
+                        checkpoint_dir / f"checkpoint_epoch_{self.epoch + 1}.pt",
+                        epoch=self.epoch,
+                        train_loss=train_loss,
+                        val_loss=self._val_loss,
+                        is_best=False,
+                    )
 
             self.epoch += 1
             self._maybe_show_progress(self._show_progress_bars, self.epoch)
@@ -1020,25 +1100,58 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         assert self._neural_net is not None
 
         train_loss_sum = 0
+        use_amp = getattr(self, 'use_amp', False)
+        grad_scaler = getattr(self, 'grad_scaler', None)
+
         for batch in train_loader:
             self.optimizer.zero_grad()
-            if loss_args is None:
-                train_losses = self._get_losses(batch=batch)
+
+            # Use AMP autocast for forward pass if enabled
+            if use_amp:
+                with autocast():
+                    if loss_args is None:
+                        train_losses = self._get_losses(batch=batch)
+                    else:
+                        train_losses = self._get_losses(batch=batch, loss_args=loss_args)
+                    train_loss = torch.mean(train_losses)
+                train_loss_sum += train_losses.sum().item()
+
+                # Scaled backward pass
+                grad_scaler.scale(train_loss).backward()
+                if clip_max_norm is not None:
+                    grad_scaler.unscale_(self.optimizer)
+                    clip_grad_norm_(
+                        self._neural_net.parameters(),
+                        max_norm=clip_max_norm,
+                    )
+                grad_scaler.step(self.optimizer)
+                grad_scaler.update()
             else:
-                train_losses = self._get_losses(batch=batch, loss_args=loss_args)
-            train_loss = torch.mean(train_losses)
-            train_loss_sum += train_losses.sum().item()
+                # Standard training path (no AMP)
+                if loss_args is None:
+                    train_losses = self._get_losses(batch=batch)
+                else:
+                    train_losses = self._get_losses(batch=batch, loss_args=loss_args)
+                train_loss = torch.mean(train_losses)
+                train_loss_sum += train_losses.sum().item()
 
-            train_loss.backward()
-            if clip_max_norm is not None:
-                clip_grad_norm_(
-                    self._neural_net.parameters(),
-                    max_norm=clip_max_norm,
-                )
-            self.optimizer.step()
+                train_loss.backward()
+                if clip_max_norm is not None:
+                    clip_grad_norm_(
+                        self._neural_net.parameters(),
+                        max_norm=clip_max_norm,
+                    )
+                self.optimizer.step()
 
+        # Handle batch_sampler case where batch_size is None
+        batch_size = train_loader.batch_size
+        if batch_size is None and hasattr(train_loader, 'batch_sampler'):
+            batch_size = getattr(train_loader.batch_sampler, 'batch_size', None)
+        if batch_size is None:
+            # Fallback: estimate from first batch or use a sensible default
+            batch_size = 1  # Will give sum instead of average if truly unknown
         train_loss_average = train_loss_sum / (
-            len(train_loader) * train_loader.batch_size  # type: ignore
+            len(train_loader) * batch_size
         )
 
         return train_loss_average
@@ -1060,20 +1173,79 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         """
 
         val_loss_sum = 0
+        use_amp = getattr(self, 'use_amp', False)
+
         with torch.no_grad():
             for batch in val_loader:
-                if loss_args is None:
-                    val_losses = self._get_losses(batch=batch)
+                # Use AMP autocast for validation if enabled
+                if use_amp:
+                    with autocast():
+                        if loss_args is None:
+                            val_losses = self._get_losses(batch=batch)
+                        else:
+                            val_losses = self._get_losses(batch=batch, loss_args=loss_args)
                 else:
-                    val_losses = self._get_losses(batch=batch, loss_args=loss_args)
+                    if loss_args is None:
+                        val_losses = self._get_losses(batch=batch)
+                    else:
+                        val_losses = self._get_losses(batch=batch, loss_args=loss_args)
                 val_loss_sum += val_losses.sum().item()
 
         # Take mean over all validation samples.
+        # Handle batch_sampler case where batch_size is None
+        batch_size = val_loader.batch_size
+        if batch_size is None and hasattr(val_loader, 'batch_sampler'):
+            batch_size = getattr(val_loader.batch_sampler, 'batch_size', None)
+        if batch_size is None:
+            batch_size = 1  # Fallback
         val_loss = val_loss_sum / (
-            len(val_loader) * val_loader.batch_size  # type: ignore
+            len(val_loader) * batch_size
         )
 
         return val_loss
+
+    def _save_checkpoint(
+        self,
+        path: Path,
+        epoch: int,
+        train_loss: float,
+        val_loss: float,
+        is_best: bool = False,
+    ) -> None:
+        """Save a training checkpoint.
+
+        Args:
+            path: Path to save the checkpoint.
+            epoch: Current epoch number.
+            train_loss: Current training loss.
+            val_loss: Current validation loss.
+            is_best: Whether this is the best model so far.
+        """
+        assert self._neural_net is not None
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self._neural_net.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "best_val_loss": self._best_val_loss,
+            "is_best": is_best,
+            "summary": self._summary,
+        }
+
+        # Include scheduler state if present
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+
+        # Include grad scaler state if using AMP
+        if hasattr(self, 'grad_scaler') and self.grad_scaler is not None:
+            checkpoint["grad_scaler_state_dict"] = self.grad_scaler.state_dict()
+
+        torch.save(checkpoint, path)
+
+        label = "best" if is_best else f"epoch {epoch + 1}"
+        print(f"  Saved checkpoint ({label}): {path}")
 
     def _summarize_epoch(
         self,

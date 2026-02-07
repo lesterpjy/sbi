@@ -213,6 +213,17 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[dict] = None,
+        use_scheduler: bool = False,
+        scheduler_factor: float = 0.2,
+        scheduler_patience: int = 1,
+        use_amp: bool = False,
+        validate_every_n_epochs: int = 1,
+        checkpoint_dir: Optional[str] = None,
+        save_every_n_epochs: int = 50,
+        save_best_only: bool = False,
+        epoch_callback: Optional[Callable] = None,
+        external_train_loader: Optional["data.DataLoader"] = None,
+        external_val_loader: Optional["data.DataLoader"] = None,
     ) -> ConditionalVectorFieldEstimator:
         r"""Returns a vector field estimator that approximates the posterior
         $p(\theta|x)$ through a continuous transformation from the base distribution
@@ -279,6 +290,15 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
             retrain_from_scratch=retrain_from_scratch,
             validation_fraction=validation_fraction,
             clip_max_norm=clip_max_norm,
+            use_scheduler=use_scheduler,
+            scheduler_factor=scheduler_factor,
+            scheduler_patience=scheduler_patience,
+            use_amp=use_amp,
+            validate_every_n_epochs=validate_every_n_epochs,
+            checkpoint_dir=checkpoint_dir,
+            save_every_n_epochs=save_every_n_epochs,
+            save_best_only=save_best_only,
+            epoch_callback=epoch_callback,
         )
 
         # Calibration kernels proposed in Lueckmann, Gonçalves et al., 2017.
@@ -303,13 +323,18 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
         # last proposal.
         proposal = self._proposal_roundwise[-1]
 
-        train_loader, val_loader = self.get_dataloaders(
-            start_idx,
-            train_config.training_batch_size,
-            train_config.validation_fraction,
-            train_config.resume_training,
-            dataloader_kwargs=dataloader_kwargs,
-        )
+        # Use external dataloaders if provided (e.g., for streaming mode)
+        if external_train_loader is not None and external_val_loader is not None:
+            train_loader = external_train_loader
+            val_loader = external_val_loader
+        else:
+            train_loader, val_loader = self.get_dataloaders(
+                start_idx,
+                train_config.training_batch_size,
+                train_config.validation_fraction,
+                train_config.resume_training,
+                dataloader_kwargs=dataloader_kwargs,
+            )
 
         self._initialize_neural_network(
             retrain_from_scratch=train_config.retrain_from_scratch,
@@ -366,9 +391,9 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
         neural_net = self._neural_net
 
         # Initialize tracking variables if not exists
-        if not hasattr(self, '_best_val_loss'):
-            self._best_val_loss = float('inf')
-            self._epochs_since_last_improvement = 0
+        # Note: _best_val_loss and _epochs_since_last_improvement are set by base class,
+        # but _best_model_state_dict is specific to this convergence check
+        if not hasattr(self, '_best_model_state_dict'):
             self._best_model_state_dict = None
 
         # Check if we have a new best loss
@@ -688,8 +713,15 @@ class VectorFieldTrainer(NeuralInference[ConditionalVectorFieldEstimator], ABC):
             # large datasets (e.g. 3.6 GB for 90k × 10 × 1000 xu).
             # A small slice is sufficient for get_numel (shape) and
             # standardizing_net (mean/std computed from this batch).
-            n_build = min(1000, len(self.train_indices))
-            build_idx = self.train_indices[:n_build]
+            # When using external dataloaders (streaming mode), train_indices
+            # is not set, so we use the first samples directly.
+            if hasattr(self, 'train_indices'):
+                n_build = min(1000, len(self.train_indices))
+                build_idx = self.train_indices[:n_build]
+            else:
+                # External dataloaders mode: use first samples directly
+                n_build = min(1000, len(theta))
+                build_idx = torch.arange(n_build)
 
             self._neural_net = self._build_neural_net(
                 theta[build_idx].to("cpu").float(),

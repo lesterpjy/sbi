@@ -45,6 +45,13 @@ def warn_if_zscoring_changes_data(x: Tensor, duplicate_tolerance: float = 0.1) -
         duplicate_tolerance: Tolerated proportion of duplicates after z-scoring.
     """
 
+    # Skip for large tensors: torch.unique + z-scoring allocate multiple full
+    # copies of x, which can OOM on memory-constrained systems (e.g. 4 GB xu
+    # tensor on a 16 GB system).  The check is a best-effort warning, not
+    # essential for correctness.
+    if x.nelement() > 50_000_000:  # ~200 MB at float32
+        return
+
     # Count unique xs.
     num_unique = torch.unique(x, dim=0).numel()
 
@@ -369,6 +376,12 @@ def handle_invalid_x(
 
     batch_size = x.shape[0]
 
+    # Early return when caller opts out of filtering — avoids allocating
+    # large temporary tensors (reshape + isnan + isinf) that can OOM on
+    # big datasets (e.g. 200k × 10 × 1000 → 2B-element boolean tensors).
+    if not exclude_invalid_x:
+        return ones(batch_size, dtype=torch.bool), 0, 0
+
     # Squeeze to cover all dimensions in case of multidimensional x.
     x = x.reshape(batch_size, -1)
 
@@ -379,10 +392,7 @@ def handle_invalid_x(
     num_nans = int(x_is_nan.sum().item())
     num_infs = int(x_is_inf.sum().item())
 
-    if exclude_invalid_x:
-        is_valid_x = ~x_is_nan & ~x_is_inf
-    else:
-        is_valid_x = ones(batch_size, dtype=torch.bool)
+    is_valid_x = ~x_is_nan & ~x_is_inf
 
     assert (
         is_valid_x.sum() > 0

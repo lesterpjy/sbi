@@ -73,6 +73,29 @@ class TrainConfig:
     # Regularization / safety
     clip_max_norm: Optional[float] = None
 
+    # Learning rate scheduler (ReduceLROnPlateau, matching official FMPE)
+    use_scheduler: bool = False
+    scheduler_factor: float = 0.2      # Multiply LR by this on plateau
+    scheduler_patience: int = 1        # Epochs to wait before reducing LR
+
+    # Automatic Mixed Precision (AMP) for faster GPU training
+    use_amp: bool = False
+
+    # Validation frequency: validate every N epochs instead of every epoch
+    # For large datasets, validation can be 30-50% of epoch time
+    validate_every_n_epochs: int = 1
+
+    # Checkpointing: save model periodically and keep best model
+    checkpoint_dir: Optional[str] = None  # Directory to save checkpoints (None = no checkpointing)
+    save_every_n_epochs: int = 50         # Save checkpoint every N epochs
+    save_best_only: bool = False          # If True, only save when validation loss improves
+
+    # Epoch callback for live logging (e.g., to wandb)
+    # Signature: callback(epoch: int, train_loss: float, val_loss: float, lr: float,
+    #                     best_val_loss: float, epochs_since_improvement: int,
+    #                     validated_this_epoch: bool) -> None
+    epoch_callback: Optional[Callable] = None
+
     def __post_init__(self):
         validate_positive_int(self.training_batch_size, "training_batch_size")
         validate_positive_float(self.learning_rate, "learning_rate")

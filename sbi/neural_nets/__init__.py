@@ -10,6 +10,7 @@ from sbi.neural_nets.factory import (
     posterior_flow_nn,
     posterior_nn,
     posterior_score_nn,
+    posterior_vfm_nn,
 )
 
 
@@ -48,6 +49,8 @@ def __getattr__(name):
         return posterior_nn
     elif name == "posterior_score_nn":
         return posterior_score_nn
+    elif name == "posterior_vfm_nn":
+        return posterior_vfm_nn
     elif name == "marginal_nn":
         return marginal_nn
     raise AttributeError(f"Module '{__name__}' has no attribute '{name}'")
@@ -60,5 +63,6 @@ __all__ = [
     "posterior_nn",
     "posterior_score_nn",
     "posterior_flow_nn",
+    "posterior_vfm_nn",
     "flowmatching_nn",  # To be removed
 ]

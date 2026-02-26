@@ -33,6 +33,7 @@ from sbi.neural_nets.net_builders.mixed_nets import build_mnle, build_mnpe
 from sbi.neural_nets.net_builders.vector_field_nets import (
     build_flow_matching_estimator,
     build_score_matching_estimator,
+    build_vfm_estimator,
 )
 from sbi.utils.nn_utils import check_net_device
 from sbi.utils.vector_field_utils import VectorFieldNet
@@ -582,6 +583,86 @@ def posterior_flow_nn(
     def build_fn(batch_theta, batch_x):
         # Build the flow matching estimator
         return build_flow_matching_estimator(
+            batch_x=batch_theta,
+            batch_y=batch_x,
+            **kwargs,
+        )
+
+    return build_fn
+
+
+def posterior_vfm_nn(
+    model: Union[
+        Literal["mlp"],
+        VectorFieldNet,
+    ] = "mlp",
+    z_score_theta: Optional[str] = None,
+    z_score_x: Optional[str] = "independent",
+    hidden_features: int = 100,
+    num_layers: int = 5,
+    embedding_net: nn.Module = nn.Identity(),
+    time_emb_type: Literal["sinusoidal", "fourier"] = "sinusoidal",
+    t_embedding_dim: int = 32,
+    alpha_time_exponent: float = 0.0,
+    noise_scale: float = 1e-3,
+    **kwargs: Any,
+) -> Callable:
+    """Build util function that builds a VFMEstimator for VFMPE.
+
+    Args:
+        model: Type of regression network. Currently only 'mlp' is supported.
+        z_score_theta: Not supported for VFMPE.
+        z_score_x: Whether to z-score xs passing into the network.
+        hidden_features: Number of hidden units per layer.
+        num_layers: Number of hidden layers.
+        embedding_net: Embedding network for x (conditioning variable).
+        time_emb_type: Type of time embedding.
+        t_embedding_dim: Embedding dimension for diffusion time.
+        alpha_time_exponent: Exponent for the VFMPE time prior.
+        noise_scale: sigma_min for numerical stability.
+
+    Returns:
+        Constructor function for VFMPE.
+    """
+    if z_score_theta is not None:
+        raise ValueError(
+            "z_score_theta is not supported for VFMPE. "
+            "VFMPE handles bounded parameters natively via sigmoid."
+        )
+
+    kwargs = dict(
+        zip(
+            (
+                "z_score_x",
+                "z_score_y",
+                "embedding_net",
+                "hidden_features",
+                "time_embedding_dim",
+                "time_emb_type",
+                "net",
+                "num_layers",
+                "alpha_time_exponent",
+                "noise_scale",
+            ),
+            (
+                z_score_x,
+                z_score_theta,
+                embedding_net,
+                hidden_features,
+                t_embedding_dim,
+                time_emb_type,
+                model,
+                num_layers,
+                alpha_time_exponent,
+                noise_scale,
+            ),
+            strict=False,
+        ),
+        **kwargs,
+    )
+
+    def build_fn(batch_theta, batch_x):
+        return build_vfm_estimator(
             batch_x=batch_theta,
             batch_y=batch_x,
             **kwargs,

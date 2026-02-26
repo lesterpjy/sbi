@@ -497,11 +497,15 @@ def get_simulations_since_round(
         starting_round_index: From which round onwards to return the data. We start
             counting from 0.
     """
-    return torch.cat([
+    filtered = [
         t
         for t, r in zip(data, data_round_indices, strict=False)
         if r >= starting_round_index
-    ])
+    ]
+    # Avoid unnecessary copy when only one round of data exists
+    if len(filtered) == 1:
+        return filtered[0]
+    return torch.cat(filtered)
 
 
 def mask_sims_from_prior(round_: int, num_simulations: int) -> Tensor:

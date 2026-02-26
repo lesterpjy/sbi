@@ -15,6 +15,7 @@ from sbi.neural_nets.estimators.score_estimator import (
     VEScoreEstimator,
     VPScoreEstimator,
 )
+from sbi.neural_nets.estimators.vfm_estimator import VFMEstimator
 from sbi.utils.nn_utils import get_numel
 from sbi.utils.sbiutils import (
     standardizing_net,
@@ -175,6 +176,96 @@ def build_flow_matching_estimator(*args, **kwargs):
 
 def build_score_matching_estimator(*args, **kwargs):
     return build_vector_field_estimator(*args, estimator_type="score", **kwargs)
+
+
+def build_vfm_estimator(
+    batch_x: Tensor,
+    batch_y: Tensor,
+    z_score_x: Optional[str] = None,
+    z_score_y: Optional[str] = None,
+    embedding_net: nn.Module = nn.Identity(),
+    hidden_features: Union[Sequence[int], int] = 100,
+    time_embedding_dim: int = 32,
+    num_layers: int = 5,
+    net: Union[
+        Literal["mlp"],
+        VectorFieldNet,
+    ] = "mlp",
+    alpha_time_exponent: float = 0.0,
+    noise_scale: float = 1e-3,
+    **kwargs,
+) -> VFMEstimator:
+    """Build a VFM (Variational Flow Matching) estimator.
+
+    The network outputs 2*D values: sigmoid-squashed data endpoint
+    and unconstrained noise endpoint.
+
+    Args:
+        batch_x: Batch of xs (theta), used to infer dimensionality.
+        batch_y: Batch of ys (observations), used to infer dimensionality.
+        z_score_x: Whether to z-score xs passing into the network.
+        z_score_y: Whether to z-score ys passing into the network.
+        embedding_net: Embedding network for batch_y.
+        hidden_features: Number of hidden features in each layer.
+        time_embedding_dim: Dimension of time embedding.
+        num_layers: Number of layers.
+        net: Network architecture (currently only "mlp" supported).
+        alpha_time_exponent: Exponent for the time prior.
+        noise_scale: sigma_min for numerical stability.
+        **kwargs: Additional arguments.
+
+    Returns:
+        A VFMEstimator instance.
+    """
+    check_data_device(batch_x, batch_y)
+
+    x_numel = get_numel(batch_x)
+
+    # Build MLP with output_dim = 2 * input_dim
+    if net == "mlp":
+        mlp_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k
+            not in [
+                "condition_emb_dim",
+                "mlp_ratio",
+                "num_intermediate_mlp_layers",
+                "adamlp_ratio",
+            ]
+        }
+        vectorfield_net = build_standard_mlp_network(
+            batch_x=batch_x,
+            batch_y=batch_y,
+            hidden_features=hidden_features,
+            num_layers=num_layers,
+            time_embedding_dim=time_embedding_dim,
+            embedding_net=embedding_net,
+            output_dim=2 * x_numel,
+            **mlp_kwargs,
+        )
+    elif isinstance(net, nn.Module):
+        vectorfield_net = net
+    else:
+        raise ValueError(f"Unknown architecture for VFM: {net}")
+
+    # Z-score setup for condition
+    embedding_net_y = (
+        nn.Sequential(
+            standardizing_net(batch_y, z_score_y == "structured"), embedding_net
+        )
+        if z_score_y
+        else embedding_net
+    )
+
+    return VFMEstimator(
+        net=vectorfield_net,
+        input_shape=batch_x[0].shape,
+        condition_shape=batch_y[0].shape,
+        embedding_net=embedding_net_y,
+        noise_scale=noise_scale,
+        alpha_time_exponent=alpha_time_exponent,
+    )
 
 
 # ======= Time Embedding Shared Components =======
@@ -444,6 +535,7 @@ class VectorFieldMLP(VectorFieldNet):
         time_emb_type: str = "random_fourier",
         sinusoidal_max_freq: float = 1000.0,
         fourier_scale: float = 30.0,
+        output_dim: Optional[int] = None,
     ):
         """Initialize vector field MLP.
 
@@ -459,6 +551,7 @@ class VectorFieldMLP(VectorFieldNet):
             time_emb_type: Type of time embedding ("sinusoidal" or "random_fourier").
             sinusoidal_max_freq: Maximum frequency for sinusoidal embeddings.
             fourier_scale: Scale for random fourier embeddings.
+            output_dim: Dimension of output. Defaults to input_dim.
         """
         super().__init__()
 
@@ -500,7 +593,7 @@ class VectorFieldMLP(VectorFieldNet):
         self.time_linear_layer = nn.Linear(time_emb_dim, hidden_features)
 
         # Output layer
-        self.output_layer = nn.Linear(hidden_features, input_dim)
+        self.output_layer = nn.Linear(hidden_features, output_dim or input_dim)
         nn.init.zeros_(self.output_layer.weight)
 
     def forward(self, input: Tensor, condition: Tensor, t: Tensor) -> Tensor:
@@ -1111,6 +1204,7 @@ def build_standard_mlp_network(
     time_emb_type: str = "random_fourier",
     sinusoidal_max_freq: float = 1000.0,
     fourier_scale: float = 30.0,
+    output_dim: Optional[int] = None,
     **kwargs,
 ) -> VectorFieldMLP:
     """Builds a standard vector field MLP network.
@@ -1128,6 +1222,7 @@ def build_standard_mlp_network(
         time_emb_type: Type of time embedding ("sinusoidal" or "random_fourier").
         sinusoidal_max_freq: Maximum frequency for sinusoidal embeddings.
         fourier_scale: Scale for random fourier embeddings.
+        output_dim: Output dimension. Defaults to input_dim.
         **kwargs: Additional arguments.
 
     Returns:
@@ -1163,6 +1258,7 @@ def build_standard_mlp_network(
         time_emb_type=time_emb_type,
         sinusoidal_max_freq=sinusoidal_max_freq,
         fourier_scale=fourier_scale,
+        output_dim=output_dim,
     )
 
     return vectorfield_net
